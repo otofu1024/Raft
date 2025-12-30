@@ -1,0 +1,33 @@
+# --- VCS ---
+.git/
+.gitignore
+
+# --- Local virtual env (never bake into image) ---
+.venv/
+
+# --- Python caches ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+
+# --- Test / tooling caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Logs / temp ---
+*.log
+*.tmp
+
+# --- Runtime data (Raft WAL/snapshots etc.) ---
+data/
