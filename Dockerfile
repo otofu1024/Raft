@@ -5,5 +5,5 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen
 
 COPY . .
-CMD ["uv", "run", "uvicorn", "app.main:app", "--reload"]
+CMD ["uv", "run", "uvicorn", "app.raft:app", "--host", "0.0.0.0", "--port", "8000"]
 # uvicorn main:app --reload
