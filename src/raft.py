@@ -1,20 +1,36 @@
 from fastapi import FastAPI
 import httpx
-import time
+import asyncio
 import os
-
-from pydantic import BaseModel
-from typing import Any
+from contextlib import asynccontextmanager
+from pydantic import BaseModel, Field
+from typing import Literal, Any, Annotated
 
 other_nodes = os.environ["PEERS"].split(",")
 other_nodes = list(map(lambda x: x.split(":"), other_nodes))
 
+class PutCommand(BaseModel):
+    type: Literal["put"]
+    key: str
+    value: Any
+
+class DelCommand(BaseModel):
+    type: Literal["del"]
+    key: str
+
+class PatchCommand(BaseModel):
+    type: Literal["patch"]
+    values: dict[str, Any]
+
+Command = Annotated[
+    PutCommand | DelCommand | PatchCommand,
+    Field(discriminator="type")
+]
+
 class LogEntry(BaseModel):
     index: int
     term: int
-    # command example:
-    # x += 1, z -= 3
-    command: Any
+    command: Command
 
 class AppendEntriesResult(BaseModel):
     term: int
@@ -24,16 +40,11 @@ class RequestVoteResult(BaseModel):
     term: int
     voteGranted: bool
 
-class StateMachine(BaseModel):
-    x: int
-    y: int
-    z: int
-
 # 状態と受け取り、送信の関数の設定のみ
 class Node():
     def __init__(self):
-        entry = StateMachine(x=0, y=0, z=0)
-        self.state :StateMachine = entry
+        self.host: str = os.environ["NODE_ID"]
+        self.state :dict[str, Any] = {}
 
         # LeaderかCandidateかFollowerかを示すid
         self.job: str = "Follower"
@@ -78,8 +89,6 @@ class Node():
         if last_log["term"] != prevLogTerm:
             return AppendEntriesResult(term = self.currentTerm, success = False)
         
-        
-        
         if len(entries) == len(self.log) and not(self.currentTerm == term):
 
             return AppendEntriesResult()
@@ -113,24 +122,45 @@ class Node():
             return RequestVoteResult(term = self.currentTerm, voteGranted = voteGranted)
     
         return RequestVoteResult(self.currentTerm, voteGranted)
+    
+    def apply(self, command: Command) -> None:
+        self.state 
+    
 
-node = Node()
-
-app = FastAPI()
-
-# Rules for Servers
-@app.get("/")
-async def raft():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 起動時に1回（startup）
+    # 例: app.state.db = await connect_db()
     while True:
         if node.commitIndex > node.lastApplied:
             node.lastApplied += 1
-            command = node.log[node.lastApplied]["command"].split(", ")
-            node.state = node.log[node.lastApplied]
+            if node.log[node.lastApplied].command == PutCommand:
+                async with httpx.AsyncClient() as client:
+                    r = await client.get('http://localhost:8000/kvs')
+                    return (r.status_code, r.text)
 
-        return other_nodes
+        await asyncio.sleep(0.05)
+
+    yield
+
+    # 終了時に1回（shutdown）
+    # 例: await app.state.db.close()
+
+node = Node()
+
+app = FastAPI(lifespan=lifespan)
+
+# Rules for Servers
+@app.post("/")
+async def raft():
+    return other_nodes
+
+@app.put("/kvs")
+async def put_states():
+    return node.state
 
 @app.get("/test")
 async def main():
     async with httpx.AsyncClient() as client:
-            r = await client.get(f'http://n2:8000')
-            return (r.status_code, r.text)
+        r = await client.get('http://n2:8000')
+        return (r.status_code, r.text)
