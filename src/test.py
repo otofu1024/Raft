@@ -1,3 +1,3 @@
-other_nodes = "n2:8000,n3:8000".split(",")
-other_nodes = list(map(lambda x: x.split(":"), other_nodes))
-print(other_nodes)
+d = {"name": "tanaka", "age": 0}
+for k, v in d.items():
+    print(k, v)          # name, age
