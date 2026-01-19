@@ -1,13 +1,24 @@
 from fastapi import FastAPI
 import httpx
 import asyncio
-import os
 from contextlib import asynccontextmanager
+
+import os, random, time
+
 from pydantic import BaseModel
 from typing import Any
 
-other_nodes = os.environ["PEERS"].split(",")
+other_nodes: list[str] = os.environ["PEERS"].split(",")
 other_nodes = list(map(lambda x: x.split(":"), other_nodes))
+
+heartbeat_interval: float = 0.100
+election_timeout_range: tuple[float] = (0.010, 0.500)
+now: float = time.monotonic()
+
+class State(BaseModel):
+    name: str
+    age: int
+    gender: str | None
 
 class Command(BaseModel):
     key: str
@@ -18,19 +29,6 @@ class LogEntry(BaseModel):
     term: int
     command: list[Command]
 
-class AppendEntriesResult(BaseModel):
-    term: int
-    success: bool
-
-class RequestVoteResult(BaseModel):
-    term: int
-    voteGranted: bool
-
-class State(BaseModel):
-    name: str
-    age: int
-    gender: str | None
-
 class AppendEntriesArgs(BaseModel):
     term: int
     leaderID: str
@@ -38,6 +36,20 @@ class AppendEntriesArgs(BaseModel):
     prevLogTerm: int
     entries: list[LogEntry]
     leaderCommit: int
+
+class AppendEntriesResult(BaseModel):
+    term: int
+    success: bool
+
+class RequestVoteArgs(BaseModel):
+    term:int
+    candidateid: str
+    lastLogIndex: int
+    lastLogTerm: int
+
+class RequestVoteResult(BaseModel):
+    term: int
+    voteGranted: bool
 
 
 # 状態と受け取り、送信の関数の設定のみ
@@ -63,59 +75,55 @@ class Node():
 
         self.leaderid: str | None = None
 
+
+
     def election_init(self):
         self.nextIndex: dict = {}
         self.matchindex: dict = {}
 
-    def get_last_log(self):
+    def get_last_log(self) -> LogEntry:
         last_log: LogEntry = next(reversed(self.log), LogEntry(index = 0, term = 0, command = []))
         return last_log
     
-    def match_prev(self, prevLogIndex: int, prevLogTerm: int):
+    def match_prev(self, prevLogIndex: int, prevLogTerm: int) -> bool:
         if (prevLogIndex == 0 and prevLogTerm == 0):
             return True
         for e in self.log:
-            if e["index"] == prevLogIndex:
-                if e["term"] == prevLogTerm:
+            if e.index == prevLogIndex:
+                if e.term == prevLogTerm:
                     return True
         return False
     
-    def AppendEntries_RPC(self,
-                          term: int,
-                          leaderID: str,
-                          prevLogIndex: int,
-                          prevLogTerm: int,
-                          entries: list[LogEntry],
-                          leaderCommit: int):
-        self.leaderid = leaderID
+    def AppendEntries_RPC(self,args: AppendEntriesArgs) -> AppendEntriesResult:
         try:
-            if term < self.currentTerm:
+            if args.term < self.currentTerm:
                 return AppendEntriesResult(term = self.currentTerm, success = False)
+            elif args.term > self.currentTerm:
+                self.votedFor = None
+                self.currentTerm = args.term
 
-            if term >= self.currentTerm:
-                self.job = "Follower"
+            self.leaderid = args.leaderID
+            self.job = "Follower"
 
-            self.currentTerm = term
+            pos_by_index = {entry.index: i for i, entry in enumerate(self.log)}
 
-            pos_by_index = {entry["index"]: i for i, entry in enumerate(self.log)}
-
-            if self.match_prev(prevLogIndex, prevLogTerm) is False:
+            if self.match_prev(args.prevLogIndex, args.prevLogTerm) is False:
                 return AppendEntriesResult(term = self.currentTerm, success = False)
             
-            for i,v in enumerate(entries):
-                a = pos_by_index.get(v["index"])
-                if a is not None:
-                    if self.log[a]["term"] != v["term"]:
-                        del self.log[a:]
-                        self.log += entries[i:]
+            for i,v in enumerate(args.entries):
+                real_index = pos_by_index.get(v.index)
+                if real_index is not None:
+                    if self.log[real_index].term != v.term:
+                        del self.log[real_index:]
+                        self.log += args.entries[i:]
                         break
                 else:
-                    self.log += entries[i:]
+                    self.log += args.entries[i:]
                     break
 
-            if leaderCommit > self.commitIndex:
+            if args.leaderCommit > self.commitIndex:
                 last_log = self.get_last_log()
-                self.commitIndex = min(leaderCommit, last_log["index"])
+                self.commitIndex = min(args.leaderCommit, last_log.index)
             
             self.apply()
             return AppendEntriesResult(term= self.currentTerm, success= True)
@@ -125,38 +133,35 @@ class Node():
             return AppendEntriesResult(term=self.currentTerm, success=False)
 
     # Candicateからフォロワーへ
-    def RequestVote_RPC(self,
-                        term:int,
-                        candidateid: str,
-                        lastLogIndex: int,
-                        lastLogTerm: int):
+    def RequestVote_RPC(self, args: RequestVoteArgs) -> RequestVoteResult:
+        
         voteGranted: bool = False
         last_log: LogEntry = self.get_last_log()
 
-        if term < self.currentTerm:
+        if args.term < self.currentTerm:
             voteGranted = False
             return RequestVoteResult(term = self.currentTerm, voteGranted = voteGranted)
-        elif term == self.currentTerm:
+        elif args.term == self.currentTerm:
             pass
         else:
             self.votedFor = None
-            self.currentTerm = term
+            self.currentTerm = args.term
             self.job = "Follower"
 
-        if self.votedFor in (candidateid, None) and lastLogTerm > last_log["term"]:
+        if self.votedFor in (args.candidateid, None) and args.lastLogTerm > last_log.term:
             voteGranted = True
-            self.votedFor = candidateid
+            self.votedFor = args.candidateid
             return RequestVoteResult(term = self.currentTerm, voteGranted = voteGranted)
         
-        if self.votedFor in (candidateid, None) and lastLogTerm == last_log["term"] and lastLogIndex >= last_log["index"]:
+        if self.votedFor in (args.candidateid, None) and args.lastLogTerm == last_log.term and args.lastLogIndex >= last_log.index:
             voteGranted = True
-            self.votedFor = candidateid
+            self.votedFor = args.candidateid
             return RequestVoteResult(term = self.currentTerm, voteGranted = voteGranted)
     
         return RequestVoteResult(self.currentTerm, voteGranted)
     
     def apply(self):
-        pos_by_index = {entry["index"]: i for i, entry in enumerate(self.log)}
+        pos_by_index = {entry.index: i for i, entry in enumerate(self.log)}
         while self.commitIndex > self.lastApplied:
             self.lastApplied += 1
             apply_index = pos_by_index.get(self.lastApplied)
@@ -164,15 +169,18 @@ class Node():
             if apply_index is None:
                 raise RuntimeError(f"Missing log entry for index={self.lastApplied}")
             
-            apply_cmd = self.log[apply_index]["command"]
+            apply_cmd = self.log[apply_index].command
             for i in apply_cmd:
-                self.state[i["key"]] = i["value"]
+                self.state[i.key] = i.value
     
 # 常駐処理
 async def raft_loop(stop_event: asyncio.Event):
     try:
         while not stop_event.is_set():
             # timeoutとかheartbeatとか色々
+            now = time.monotonic()
+            
+
             await asyncio.sleep(0.1)
 
     except asyncio.CancelledError:
@@ -203,7 +211,7 @@ async def raft():
 
 @app.get("/get")
 async def get_states():
-    return node.state
+    return node.state, node.currentTerm
 
 @app.get("/get/log")
 async def get_log():
@@ -222,13 +230,10 @@ async def test():
 async def to_followre():
     pass
 
-@app.post("/test/append_entries")
+@app.post("/append_entries")
 async def test_send_append_entries(args: AppendEntriesArgs):
-        return node.AppendEntries_RPC(
-            term=args.term,
-            leaderID=args.leaderID,
-            prevLogIndex=args.prevLogIndex,
-            prevLogTerm=args.prevLogTerm,
-            entries=args.entries,
-            leaderCommit=args.leaderCommit,
-        )
+        return node.AppendEntries_RPC(args)
+
+@app.get("/timer_reset")
+async def timer_reset():
+    deadline = random.random(election_timeout_range)

@@ -3,25 +3,35 @@ import httpx
 
 async def main():
     payload = {
-        "term": 1,
-        "leaderID": "n1",
-        "prevLogIndex": 0,
-        "prevLogTerm": 0,
+        "term": 5,
+        "leaderID": "n2",
+        "prevLogIndex": 1,
+        "prevLogTerm": 1,
         "entries": [
             {
-                "index":1,
-                "term":1,
+                "index":4,
+                "term":4,
                 "command": [
-                    {"key":"name","value":"eito"},
-                    {"key":"age", "value":3}
+                    {"key":"name","value":"sako"},
+                    {"key":"age","value":5},
+                    {"key":"gender", "value":"female"}
+                    ]
+            },
+            {
+                "index":5,
+                "term":4,
+                "command": [
+                    {"key":"name","value":"inari"},
+                    {"key":"age","value":10},
+                    {"key":"gender", "value":"male"}
                     ]
             }
         ],
-        "leaderCommit": 1
+        "leaderCommit": 999
     }
 
     async with httpx.AsyncClient(timeout = 2.0) as client:
-        r = await client.post("http://localhost:8001/test/append_entries", json = payload)
+        r = await client.post("http://localhost:8001/append_entries", json = payload)
         print(r.status_code)
         print(r.json())
 
