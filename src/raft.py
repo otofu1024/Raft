@@ -24,6 +24,8 @@ class Job(str, Enum):
     candidate = "Candidate"
     leader = "Leader"
 
+
+
 class Command(BaseModel):
     key: str
     value: Any
@@ -55,6 +57,13 @@ class RequestVoteResult(BaseModel):
     term: int
     voteGranted: bool
 
+class GetnextIndexResult(BaseModel):
+    host: str
+    nextIndex: int
+
+class team_index(BaseModel):
+    nextIndex: dict[str, int]
+    matchIndex: dict[str, int]
 
 # 本体。ノードの状態管理
 class Node():
@@ -91,8 +100,12 @@ class Node():
         self.timeout:float = random.uniform(0.150, 0.300)
 
     def election_init(self):
-        self.nextIndex: dict = {}
-        self.matchindex: dict = {}
+        self.nextIndex: dict[str, int] = {}
+        self.matchindex: dict[str, int] = {}
+        
+        for i in other_nodes:
+            self.nextIndex[i] = self.get_last_log().index + 1
+            self.matchindex[i] = 0
 
     def get_last_log(self) -> LogEntry:
         last_log: LogEntry = next(reversed(self.log), LogEntry(index = 0, term = 0, command = []))
@@ -106,15 +119,6 @@ class Node():
                              term= term,
                              command= command)
         self.log.append(log_entry)
-
-    def match_prev(self, prevLogIndex: int, prevLogTerm: int) -> bool:
-        if (prevLogIndex == 0 and prevLogTerm == 0):
-            return True
-        for e in self.log:
-            if e.index == prevLogIndex:
-                if e.term == prevLogTerm:
-                    return True
-        return False
     
     def AppendEntries_RPC(self, args: AppendEntriesArgs) -> AppendEntriesResult:
         try:
@@ -131,7 +135,16 @@ class Node():
 
             pos_by_index = {entry.index: i for i, entry in enumerate(self.log)}
 
-            if self.match_prev(args.prevLogIndex, args.prevLogTerm) is False:
+            # ログの一致検査
+            r = False
+            if (args.prevLogIndex == 0 and args.prevLogTerm == 0):
+                r = True
+            for e in self.log:
+                if e.index == args.prevLogIndex:
+                    if e.term == args.prevLogTerm:
+                        r = True
+            
+            if r is False:
                 return AppendEntriesResult(term = self.currentTerm, success = False)
             
             for i,v in enumerate(args.entries):
@@ -150,8 +163,6 @@ class Node():
                 self.commitIndex = min(args.leaderCommit, last_log.index)
             
             self.apply()
-            self.nextIndex += 1
-            self.matchindex += 1
             return AppendEntriesResult(term= self.currentTerm, success= True)
 
         except Exception as e:
@@ -201,15 +212,8 @@ class Node():
 
     async def send_RequestVote_rpc(self, url: str, payload: RequestVoteArgs):
         try:
-            r = await self.client.post(url, json = payload.model_dump())
-            return url, r.status_code, r.json()
-        except Exception as e:
-            return url, None, {"error": str(e)}
-        
-    async def send_AppendEntries_rpc(self, url: str, payload: AppendEntriesArgs):
-        try:
-            r = await self.client.post(url, json = payload.model_dump())
-            return url, r.status_code, r.json()
+            r = await self.client.post(url, json = payload.model_dump(), timeout= 0.05)
+            return RequestVoteResult(r.json())
         except Exception as e:
             return url, None, {"error": str(e)}
 
@@ -253,15 +257,45 @@ class Node():
     # Leader処理
     async def leader(self):
         last_log: LogEntry = self.get_last_log()
-        payload = AppendEntriesArgs(term=self.currentTerm,
-                                    leaderID=self.host,
-                                    prevLogIndex=last_log.index,
-                                    prevLogTerm=last_log.term,
-                                    entries=self.log,
-                                    leaderCommit=self.commitIndex)
-        
-        tasks = [asyncio.create_task(self.send_AppendEntries_rpc(url=f"http://{i}/RequestVote",
-                                                                  payload=payload.model_dump()) for i in other_nodes)]
+        pos_by_index = {entry.index: i for i, entry in enumerate(self.log)}
+
+        tasks = [
+            asyncio.create_task(self.client.post(url=f"http://{i}/get/last_log", timeout=0.050))
+            for i in other_nodes
+        ]
+        nextIndex = self.nextIndex
+
+        try:
+            for i in asyncio.as_completed(tasks):
+                resp = await i
+                resp = resp.json()
+                resp = LogEntry(**resp)
+                if resp.index >= self.nextIndex[]:
+                    real_nextIndex = pos_by_index.get(nextIndex)
+                    while True:
+                        entries = self.log[real_nextIndex:]
+                        payload = AppendEntriesArgs(term=self.currentTerm,
+                                leaderID=self.host,
+                                prevLogIndex=last_log.index,
+                                prevLogTerm=last_log.term,
+                                entries=entries,
+                                leaderCommit=self.commitIndex)
+                        
+                        r = await self.client.post(url = f"http://{resp.host}/AppendEntries", json = payload.model_dump(),  timeout=0.05)
+                        r = AppendEntriesResult(r.json())
+                
+                        if self.currentTerm >= r.term and r.success is False:
+                            break
+                        
+                        if r.success is True:
+                            pay = team_index(nextIndex= nextIndex, matchIndex=nextIndex-1)
+                            await self.client.post(url = f"http://{resp.host}/update/nextIndex", json = pay.model_dump())
+
+                        nextIndex -= 1
+                        real_nextIndex -= 1
+
+        except Exception as e:
+            pass
 
 
     # 常駐処理
@@ -270,7 +304,6 @@ class Node():
             while not stop_event.is_set():
                 # timeoutとかheartbeatとか色々
                 now = time.monotonic()
-
                 # 選挙開始
                 if now - node.start_time > self.timeout:
                     node.job = Job.candidate
@@ -278,6 +311,10 @@ class Node():
                         await asyncio.wait_for(node.elect(), timeout = node.timeout)
                     except asyncio.TimeoutError:
                         continue
+
+                if node.job == Job.leader:
+                    await self.leader()
+
 
                 await asyncio.sleep(0.005)
 
@@ -316,6 +353,14 @@ async def get_states():
 async def get_log():
     return node.log
 
+@app.get("/get/last_log")
+async def get_last_log():
+    return node.get_last_log()
+
+@app.get("/get/nextindex")
+async def get_nextindex():
+    return GetnextIndexResult(host = node.host, nextIndex = node.nextIndex)
+
 @app.get("/test")
 async def test():
     async with httpx.AsyncClient() as client:
@@ -325,17 +370,19 @@ async def test():
 # Rules for Servers
 ## All Servers
 
+@app.post("/update/Indexies")
+async def update_indexies(args: team_index):
+    node.nextIndex = args.nextIndex
+    node.matchindex = args.matchIndex
+    return {node.nextIndex, node.matchindex}
+
 @app.post("/RequestVote")
 async def vote(args: RequestVoteArgs):
     return node.RequestVote_RPC(args)
 
-@app.post("/append_entries")
+@app.post("/AppendEntries")
 async def test_send_append_entries(args: AppendEntriesArgs):
     return node.AppendEntries_RPC(args)
-
-@app.get("/get_nextindex")
-async def get_nextindex():
-    return node.nextIndex
 
 @app.post("/from_client")
 async def client(command: Command):
