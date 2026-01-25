@@ -9,15 +9,15 @@ import time
 
 from enum import Enum
 from pydantic import BaseModel
-from typing import Any
+from typing import Any, Literal
+
+import logging
 
 other_nodes: list[str] = os.environ["PEERS"].split(",")
 
+
 # 型定義
-class State(BaseModel):
-    name: str
-    age: int
-    gender: str | None
+StateKey = Literal["name", "age", "gender"]
 
 class Job(str, Enum):
     follower = "Follower"
@@ -25,7 +25,7 @@ class Job(str, Enum):
     leader = "Leader"
 
 class Command(BaseModel):
-    key: str
+    key: StateKey
     value: Any
 
 class LogEntry(BaseModel):
@@ -129,7 +129,6 @@ class Node():
         self.job = Job.follower
 
         # prevLog の整合性チェック
-        # prevLogIndex==0 のときはダミーを参照
         if args.prevLogIndex >= len(self.log):
             return AppendEntriesResult(host=self.host, term=self.currentTerm, success=False)
 
@@ -149,12 +148,13 @@ class Node():
                 self.log.extend(args.entries[i:])
                 break
 
-        # 4) commitIndex 更新
+        # commitIndex 更新
         last_index = len(self.log) - 1
         if args.leaderCommit > self.commitIndex:
             self.commitIndex = min(args.leaderCommit, last_index)
 
         self.apply()
+
         return AppendEntriesResult(host=self.host, term=self.currentTerm, success=True)
 
 
@@ -193,7 +193,6 @@ class Node():
     def apply(self):
         while self.commitIndex > self.lastApplied:
             self.lastApplied += 1
-            # self.log[self.lastApplied] が「適用対象のエントリ」
             for cmd in self.log[self.lastApplied].command:
                 self.state[cmd.key] = cmd.value
 
@@ -218,9 +217,8 @@ class Node():
             )
 
             r = await self.client.post(url, json=payload.model_dump(), timeout=0.05)
-            resp = AppendEntriesResult(**r.json())
+            resp = AppendEntriesResult.model_validate(r.json())
 
-            # term で負けたら降格
             if resp.term > self.currentTerm:
                 self.currentTerm = resp.term
                 self.job = Job.follower
@@ -229,7 +227,6 @@ class Node():
                 return resp
 
             if resp.success:
-                # 送った分だけ進める
                 sent = len(entries)
                 self.matchIndex[peer] = prevLogIndex + sent
                 self.nextIndex[peer] = self.matchIndex[peer] + 1
@@ -256,7 +253,7 @@ class Node():
                     if self.job != Job.candidate:
                         return
                     r = await done
-                    res = RequestVoteResult(**r.json())
+                    res = RequestVoteResult.model_validate(r.json())
                     if res.term > self.currentTerm:
                         self.currentTerm = res.term
                         self.job = Job.follower
@@ -270,7 +267,7 @@ class Node():
                 if vote is True:
                     ok += 1
                     if ok >= need:
-                        ## 見事選挙勝利！
+                        ## 見事選挙勝利！おめ！！！
                         self.job = Job.leader
                         self.leaderid = self.host
                         self.leader_init()
@@ -307,12 +304,11 @@ class Node():
                 if resp.term > self.currentTerm:
                     return
 
-                # ここが本体：matchIndex から commitIndex を進める
                 last_index = len(self.log) - 1
                 for N in range(last_index, self.commitIndex, -1):
                     if self.log[N].term != self.currentTerm:
                         continue
-                    replicated = 1  # self
+                    replicated = 1
                     for peer in other_nodes:
                         if self.matchIndex.get(peer, 0) >= N:
                             replicated += 1
@@ -416,7 +412,7 @@ async def test_send_append_entries(args: AppendEntriesArgs):
 async def client(command: list[Command]):
     if node.job == Job.leader:
         node.add_log_entry(command)
-        return node.state
+        return node.log[-1]
     elif node.leaderid is None:
         raise HTTPException(status_code=503, detail="leader election in progress")
     else:

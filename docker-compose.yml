@@ -4,7 +4,7 @@ services:
     environment:
       NODE_ID: n1
       PORT: "8000"
-      PEERS: "n2:8000,n3:8000"
+      PEERS: "n2:8000,n3:8000,n4:8000,n5:8000"
     ports:
       - "8001:8000"
     volumes:
@@ -16,7 +16,7 @@ services:
     environment:
       NODE_ID: n2
       PORT: "8000"
-      PEERS: "n1:8000,n3:8000"
+      PEERS: "n1:8000,n3:8000,n4:8000,n5:8000"
     ports:
       - "8002:8000"
     volumes:
@@ -28,9 +28,33 @@ services:
     environment:
       NODE_ID: n3
       PORT: "8000"
-      PEERS: "n1:8000,n2:8000"
+      PEERS: "n1:8000,n2:8000,n4:8000,n5:8000"
     ports:
       - "8003:8000"
     volumes:
       - ./data/n3:/data
+    restart: unless-stopped
+
+  n4:
+    build: .
+    environment:
+      NODE_ID: n4
+      PORT: "8000"
+      PEERS: "n1:8000,n2:8000,n3:8000,n5:8000"
+    ports:
+      - "8004:8000"
+    volumes:
+      - ./data/n4:/data
+    restart: unless-stopped
+
+  n5:
+    build: .
+    environment:
+      NODE_ID: n5
+      PORT: "8000"
+      PEERS: "n1:8000,n2:8000,n3:8000,n4:8000"
+    ports:
+      - "8005:8000"
+    volumes:
+      - ./data/n5:/data
     restart: unless-stopped
