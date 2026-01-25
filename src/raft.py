@@ -42,6 +42,7 @@ class AppendEntriesArgs(BaseModel):
     leaderCommit: int
 
 class AppendEntriesResult(BaseModel):
+    host: str
     term: int
     success: bool
 
@@ -120,7 +121,7 @@ class Node():
 
         # term check
         if args.term < self.currentTerm:
-            return AppendEntriesResult(term=self.currentTerm, success=False)
+            return AppendEntriesResult(host= self.host, term=self.currentTerm, success=False)
 
         if args.term > self.currentTerm:
             self.currentTerm = args.term
@@ -132,10 +133,10 @@ class Node():
         # prevLog の整合性チェック
         # prevLogIndex==0 のときはダミーを参照
         if args.prevLogIndex >= len(self.log):
-            return AppendEntriesResult(term=self.currentTerm, success=False)
+            return AppendEntriesResult(host=self.host, term=self.currentTerm, success=False)
 
         if self.log[args.prevLogIndex].term != args.prevLogTerm:
-            return AppendEntriesResult(term=self.currentTerm, success=False)
+            return AppendEntriesResult(host=self.host, term=self.currentTerm, success=False)
 
         # entries を反映
         for e in args.entries:
@@ -155,7 +156,7 @@ class Node():
             self.commitIndex = min(args.leaderCommit, last_index)
 
         self.apply()
-        return AppendEntriesResult(term=self.currentTerm, success=True)
+        return AppendEntriesResult(host=self.host, term=self.currentTerm, success=True)
 
 
     # Candicateからフォロワーへ
@@ -290,20 +291,41 @@ class Node():
             self.nextIndex[i] = last_log.index + 1
             self.matchIndex[i] = 0
 
-    # Leader処理
     async def leader(self):
-        last_index = len(self.log) - 1
-        tasks = []
-        for peer in other_nodes:
-            if last_index >= self.nextIndex[peer]:
-                tasks.append(asyncio.create_task(self.send_AppendEntries_rpc(peer)))
-            else:
-                # heartbeat を送りたいなら、entries=[] で send_AppendEntries_rpc を呼んでもOK
-                tasks.append(asyncio.create_task(self.send_AppendEntries_rpc(peer)))
+        need = (len(other_nodes) + 1) // 2 + 1
 
-        # まとめて待つ（待ちたくないなら as_completed にする）
-        await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [asyncio.create_task(self.send_AppendEntries_rpc(peer)) for peer in other_nodes]
 
+        try:
+            for fut in asyncio.as_completed(tasks, timeout=self.heartbeat):
+                try:
+                    resp = await fut  # resp: AppendEntriesResult だと仮定
+                except Exception:
+                    continue
+
+                if resp.term > self.currentTerm:
+                    return
+
+                # ここが本体：matchIndex から commitIndex を進める
+                last_index = len(self.log) - 1
+                for N in range(last_index, self.commitIndex, -1):
+                    if self.log[N].term != self.currentTerm:
+                        continue
+                    replicated = 1  # self
+                    for peer in other_nodes:
+                        if self.matchIndex.get(peer, 0) >= N:
+                            replicated += 1
+                    if replicated >= need:
+                        self.commitIndex = N
+                        self.apply()
+                        break
+
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
 
     # 常駐処理
     async def loop(self, stop_event: asyncio.Event):
@@ -321,6 +343,8 @@ class Node():
 
                 if node.job == Job.leader:
                     await self.leader()
+
+
 
 
                 await asyncio.sleep(0.005)
