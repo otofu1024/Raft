@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 import httpx
 import asyncio
 from contextlib import asynccontextmanager
@@ -29,7 +29,6 @@ class Command(BaseModel):
     value: Any
 
 class LogEntry(BaseModel):
-    index: int
     term: int
     command: list[Command]
 
@@ -58,7 +57,7 @@ class RequestVoteResult(BaseModel):
 
 class GetnextIndexResult(BaseModel):
     host: str
-    nextIndex: int
+    nextIndex: dict[str, int]
 
 class team_index(BaseModel):
     nextIndex: dict[str, int]
@@ -76,7 +75,7 @@ class Node():
         # Persistent state on all services
         self.currentTerm: int = 0
         self.votedFor: str | None = None
-        self.log: list[LogEntry] = [LogEntry(index=0, term=0, command=[])]
+        self.log: list[LogEntry] = [LogEntry(term=0, command=[])]
 
 
         # Volatile state on all services
@@ -91,7 +90,7 @@ class Node():
         # timer
         self.timer_init()
 
-        self.heartbeat: float = 0.010
+        self.heartbeat: float = 0.100
 
         self.client = httpx.AsyncClient(timeout = 0.500)
 
@@ -104,16 +103,15 @@ class Node():
         self.matchIndex: dict[str, int] = {}
         
         for i in other_nodes:
-            self.nextIndex[i] = self.get_last_log().index + 1
+            self.nextIndex[i] = len(self.log)
             self.matchIndex[i] = 0
 
     def get_last_log(self) -> LogEntry:
         return self.log[-1]
     
     def add_log_entry(self, command: list[Command]):
-        index = len(self.log)
         term = self.currentTerm
-        self.log.append(LogEntry(index=index, term=term, command=command))
+        self.log.append(LogEntry(term=term, command=command))
 
     
     def AppendEntries_RPC(self, args: AppendEntriesArgs) -> AppendEntriesResult:
@@ -139,16 +137,17 @@ class Node():
             return AppendEntriesResult(host=self.host, term=self.currentTerm, success=False)
 
         # entries を反映
-        for e in args.entries:
-            if e.index < len(self.log):
-                if self.log[e.index].term != e.term:
-                    # 衝突 -> そこから先を捨てる
-                    del self.log[e.index:]
-                    self.log.extend(args.entries[e.index:])
+        start = args.prevLogIndex + 1
+        for i, e in enumerate(args.entries):
+            idx = start + i
+            if idx < len(self.log):
+                if self.log[idx].term != e.term:
+                    del self.log[idx:]
+                    self.log.extend(args.entries[i:])
+                    break
             else:
-                # ちょうど末尾に続くなら append
-                # （この前提だと e.index は len(self.log) と一致するはず）
-                self.log.append(e)
+                self.log.extend(args.entries[i:])
+                break
 
         # 4) commitIndex 更新
         last_index = len(self.log) - 1
@@ -164,6 +163,7 @@ class Node():
         
         voteGranted: bool = False
         last_log: LogEntry = self.get_last_log()
+        last_index = len(self.log) - 1
 
         if args.term < self.currentTerm:
             voteGranted = False
@@ -171,17 +171,20 @@ class Node():
         elif args.term == self.currentTerm:
             pass
         else:
+            self.leaderid = None
             self.votedFor = None
             self.currentTerm = args.term
             self.job = Job.follower
 
         if self.votedFor in (args.candidateId, None) and args.lastLogTerm > last_log.term:
             voteGranted = True
+            self.timer_init()
             self.votedFor = args.candidateId
             return RequestVoteResult(term = self.currentTerm, voteGranted = voteGranted)
         
-        if self.votedFor in (args.candidateId, None) and args.lastLogTerm == last_log.term and args.lastLogIndex >= last_log.index:
+        if self.votedFor in (args.candidateId, None) and args.lastLogTerm == last_log.term and args.lastLogIndex >= last_index:
             voteGranted = True
+            self.timer_init()
             self.votedFor = args.candidateId
             return RequestVoteResult(term = self.currentTerm, voteGranted = voteGranted)
 
@@ -202,19 +205,8 @@ class Node():
             nextIndex = self.nextIndex[peer]
             prevLogIndex = nextIndex - 1
 
-            # prevLogIndex は 0 以上である必要がある（ダミーがあるので 0 はOK）
-            if prevLogIndex < 0:
-                prevLogIndex = 0
-                self.nextIndex[peer] = 1
-                nextIndex = 1
-
-            # 自分の log が短すぎて prev を参照できないなら nextIndex を詰める
-            if prevLogIndex >= len(self.log):
-                self.nextIndex[peer] = max(1, len(self.log) - 1)
-                continue
-
             prevLogTerm = self.log[prevLogIndex].term
-            entries = self.log[nextIndex:]  # これが「nextIndex からのログ」
+            entries = self.log[nextIndex:]
 
             payload = AppendEntriesArgs(
                 term=self.currentTerm,
@@ -242,11 +234,8 @@ class Node():
                 self.matchIndex[peer] = prevLogIndex + sent
                 self.nextIndex[peer] = self.matchIndex[peer] + 1
                 return resp
-
-            # 失敗: nextIndex を下げて再試行（1未満にしない）
+            
             self.nextIndex[peer] = max(1, nextIndex - 1)
-
-
 
     async def elect(self):
         self.currentTerm += 1
@@ -255,17 +244,26 @@ class Node():
         last_log = self.get_last_log()
         payload = RequestVoteArgs(term = self.currentTerm,
                                   candidateId = self.host,
-                                  lastLogIndex = last_log.index,
+                                  lastLogIndex = len(self.log) - 1,
                                   lastLogTerm = last_log.term)
-        tasks = [asyncio.create_task(self.send_RequestVote_rpc(f"http://{i}/RequestVote", payload)) for i in other_nodes]
+        tasks = [asyncio.create_task(self.client.post(url = f"http://{i}/RequestVote", json = payload.model_dump())) for i in other_nodes]
         ok: int = 1
         need: int = (len(other_nodes)+1)//2 + 1
 
         try:
             for done in asyncio.as_completed(tasks):
                 try:
+                    if self.job != Job.candidate:
+                        return
                     r = await done
-                    vote = RequestVoteResult(**r[2]).voteGranted
+                    res = RequestVoteResult(**r.json())
+                    if res.term > self.currentTerm:
+                        self.currentTerm = res.term
+                        self.job = Job.follower
+                        self.votedFor = None
+                        return
+                    vote = res.voteGranted
+
                 except Exception:
                     vote = False
 
@@ -274,6 +272,7 @@ class Node():
                     if ok >= need:
                         ## 見事選挙勝利！
                         self.job = Job.leader
+                        self.leaderid = self.host
                         self.leader_init()
                         break
             
@@ -285,10 +284,10 @@ class Node():
                 if not t.done():
                     t.cancel()
 
-    async def leader_init(self):
-        last_log = self.get_last_log()
+    def leader_init(self):
+        last_index = len(self.log) - 1
         for i in other_nodes:
-            self.nextIndex[i] = last_log.index + 1
+            self.nextIndex[i] = last_index + 1
             self.matchIndex[i] = 0
 
     async def leader(self):
@@ -299,7 +298,9 @@ class Node():
         try:
             for fut in asyncio.as_completed(tasks, timeout=self.heartbeat):
                 try:
-                    resp = await fut  # resp: AppendEntriesResult だと仮定
+                    resp = await fut
+                    if self.job != Job.leader:
+                        return
                 except Exception:
                     continue
 
@@ -332,20 +333,18 @@ class Node():
         try:
             while not stop_event.is_set():
                 # timeoutとかheartbeatとか色々
-                now = time.monotonic()
-                # 選挙開始
-                if now - node.start_time > self.timeout:
-                    node.job = Job.candidate
-                    try:
-                        await asyncio.wait_for(node.elect(), timeout = node.timeout)
-                    except asyncio.TimeoutError:
-                        continue
+                if self.job != Job.leader:
+                    now = time.monotonic()
+                    # 選挙開始
+                    if now - self.start_time > self.timeout:
+                        self.job = Job.candidate
+                        try:
+                            await asyncio.wait_for(self.elect(), timeout = self.timeout)
+                        except asyncio.TimeoutError:
+                            continue
 
-                if node.job == Job.leader:
+                if self.job == Job.leader:
                     await self.leader()
-
-
-
 
                 await asyncio.sleep(0.005)
 
@@ -388,6 +387,10 @@ async def get_log():
 async def get_last_log():
     return node.get_last_log()
 
+@app.get("/get/leader_id")
+async def get_leader_id():
+    return node.leaderid
+
 @app.get("/get/nextindex")
 async def get_nextindex():
     return GetnextIndexResult(host = node.host, nextIndex = node.nextIndex)
@@ -401,12 +404,6 @@ async def test():
 # Rules for Servers
 ## All Servers
 
-@app.post("/update/Indexies")
-async def update_indexies(args: team_index):
-    node.nextIndex = args.nextIndex
-    node.matchindex = args.matchIndex
-    return {node.nextIndex, node.matchindex}
-
 @app.post("/RequestVote")
 async def vote(args: RequestVoteArgs):
     return node.RequestVote_RPC(args)
@@ -416,13 +413,21 @@ async def test_send_append_entries(args: AppendEntriesArgs):
     return node.AppendEntries_RPC(args)
 
 @app.post("/from_client")
-async def client(command: Command):
-    if node.host == Job.leader:
+async def client(command: list[Command]):
+    if node.job == Job.leader:
         node.add_log_entry(command)
-        node.apply()
         return node.state
+    elif node.leaderid is None:
+        raise HTTPException(status_code=503, detail="leader election in progress")
     else:
         try:
-            node.client.post(f"http://{node.leaderid}:8000/from_client", timeout=2.0)
-        except TimeoutError:
-            pass
+            r = await node.client.post(
+                f"http://{node.leaderid}:8000/from_client",
+                json=[c.model_dump() for c in command],
+                timeout=2.0,
+            )
+            return r.json()
+
+        except Exception:
+            raise HTTPException(status_code=503, detail="leader unreachable")
+
