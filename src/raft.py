@@ -24,8 +24,6 @@ class Job(str, Enum):
     candidate = "Candidate"
     leader = "Leader"
 
-
-
 class Command(BaseModel):
     key: str
     value: Any
@@ -77,7 +75,8 @@ class Node():
         # Persistent state on all services
         self.currentTerm: int = 0
         self.votedFor: str | None = None
-        self.log: list[LogEntry] = []
+        self.log: list[LogEntry] = [LogEntry(index=0, term=0, command=[])]
+
 
         # Volatile state on all services
         self.commitIndex: int = 0
@@ -101,73 +100,63 @@ class Node():
 
     def election_init(self):
         self.nextIndex: dict[str, int] = {}
-        self.matchindex: dict[str, int] = {}
+        self.matchIndex: dict[str, int] = {}
         
         for i in other_nodes:
             self.nextIndex[i] = self.get_last_log().index + 1
-            self.matchindex[i] = 0
+            self.matchIndex[i] = 0
 
     def get_last_log(self) -> LogEntry:
-        last_log: LogEntry = next(reversed(self.log), LogEntry(index = 0, term = 0, command = []))
-        return last_log
+        return self.log[-1]
     
-    def add_log_entry(self, command: Command):
-        last_log: LogEntry = self.get_last_log
-        index = last_log.index + 1
+    def add_log_entry(self, command: list[Command]):
+        index = len(self.log)
         term = self.currentTerm
-        log_entry = LogEntry(index= index,
-                             term= term,
-                             command= command)
-        self.log.append(log_entry)
+        self.log.append(LogEntry(index=index, term=term, command=command))
+
     
     def AppendEntries_RPC(self, args: AppendEntriesArgs) -> AppendEntriesResult:
-        try:
-            self.timer_init()
+        self.timer_init()
 
-            if args.term < self.currentTerm:
-                return AppendEntriesResult(term = self.currentTerm, success = False)
-            elif args.term > self.currentTerm:
-                self.votedFor = None
-                self.currentTerm = args.term
-
-            self.leaderid = args.leaderID
-            self.job = Job.follower
-
-            pos_by_index = {entry.index: i for i, entry in enumerate(self.log)}
-
-            # ログの一致検査
-            r = False
-            if (args.prevLogIndex == 0 and args.prevLogTerm == 0):
-                r = True
-            for e in self.log:
-                if e.index == args.prevLogIndex:
-                    if e.term == args.prevLogTerm:
-                        r = True
-            
-            if r is False:
-                return AppendEntriesResult(term = self.currentTerm, success = False)
-            
-            for i,v in enumerate(args.entries):
-                real_index = pos_by_index.get(v.index)
-                if real_index is not None:
-                    if self.log[real_index].term != v.term:
-                        del self.log[real_index:]
-                        self.log += args.entries[i:]
-                        break
-                else:
-                    self.log += args.entries[i:]
-                    break
-
-            if args.leaderCommit > self.commitIndex:
-                last_log = self.get_last_log()
-                self.commitIndex = min(args.leaderCommit, last_log.index)
-            
-            self.apply()
-            return AppendEntriesResult(term= self.currentTerm, success= True)
-
-        except Exception as e:
-            print("AppendEntries_RPC error:", e)
+        # term check
+        if args.term < self.currentTerm:
             return AppendEntriesResult(term=self.currentTerm, success=False)
+
+        if args.term > self.currentTerm:
+            self.currentTerm = args.term
+            self.votedFor = None
+
+        self.leaderid = args.leaderID
+        self.job = Job.follower
+
+        # prevLog の整合性チェック
+        # prevLogIndex==0 のときはダミーを参照
+        if args.prevLogIndex >= len(self.log):
+            return AppendEntriesResult(term=self.currentTerm, success=False)
+
+        if self.log[args.prevLogIndex].term != args.prevLogTerm:
+            return AppendEntriesResult(term=self.currentTerm, success=False)
+
+        # entries を反映
+        for e in args.entries:
+            if e.index < len(self.log):
+                if self.log[e.index].term != e.term:
+                    # 衝突 -> そこから先を捨てる
+                    del self.log[e.index:]
+                    self.log.extend(args.entries[e.index:])
+            else:
+                # ちょうど末尾に続くなら append
+                # （この前提だと e.index は len(self.log) と一致するはず）
+                self.log.append(e)
+
+        # 4) commitIndex 更新
+        last_index = len(self.log) - 1
+        if args.leaderCommit > self.commitIndex:
+            self.commitIndex = min(args.leaderCommit, last_index)
+
+        self.apply()
+        return AppendEntriesResult(term=self.currentTerm, success=True)
+
 
     # Candicateからフォロワーへ
     def RequestVote_RPC(self, args: RequestVoteArgs) -> RequestVoteResult:
@@ -198,24 +187,65 @@ class Node():
         return RequestVoteResult(self.currentTerm, voteGranted)
     
     def apply(self):
-        pos_by_index = {entry.index: i for i, entry in enumerate(self.log)}
         while self.commitIndex > self.lastApplied:
             self.lastApplied += 1
-            apply_index = pos_by_index.get(self.lastApplied)
+            # self.log[self.lastApplied] が「適用対象のエントリ」
+            for cmd in self.log[self.lastApplied].command:
+                self.state[cmd.key] = cmd.value
 
-            if apply_index is None:
-                raise RuntimeError(f"Missing log entry for index={self.lastApplied}")
-            
-            apply_cmd = self.log[apply_index].command
-            for i in apply_cmd:
-                self.state[i.key] = i.value
 
-    async def send_RequestVote_rpc(self, url: str, payload: RequestVoteArgs):
-        try:
-            r = await self.client.post(url, json = payload.model_dump(), timeout= 0.05)
-            return RequestVoteResult(r.json())
-        except Exception as e:
-            return url, None, {"error": str(e)}
+    async def send_AppendEntries_rpc(self, peer: str) -> AppendEntriesResult:
+        url = f"http://{peer}/AppendEntries"
+
+        while True:
+            nextIndex = self.nextIndex[peer]
+            prevLogIndex = nextIndex - 1
+
+            # prevLogIndex は 0 以上である必要がある（ダミーがあるので 0 はOK）
+            if prevLogIndex < 0:
+                prevLogIndex = 0
+                self.nextIndex[peer] = 1
+                nextIndex = 1
+
+            # 自分の log が短すぎて prev を参照できないなら nextIndex を詰める
+            if prevLogIndex >= len(self.log):
+                self.nextIndex[peer] = max(1, len(self.log) - 1)
+                continue
+
+            prevLogTerm = self.log[prevLogIndex].term
+            entries = self.log[nextIndex:]  # これが「nextIndex からのログ」
+
+            payload = AppendEntriesArgs(
+                term=self.currentTerm,
+                leaderID=self.host,
+                prevLogIndex=prevLogIndex,
+                prevLogTerm=prevLogTerm,
+                entries=entries,
+                leaderCommit=self.commitIndex,
+            )
+
+            r = await self.client.post(url, json=payload.model_dump(), timeout=0.05)
+            resp = AppendEntriesResult(**r.json())
+
+            # term で負けたら降格
+            if resp.term > self.currentTerm:
+                self.currentTerm = resp.term
+                self.job = Job.follower
+                self.votedFor = None
+                self.leaderid = None
+                return resp
+
+            if resp.success:
+                # 送った分だけ進める
+                sent = len(entries)
+                self.matchIndex[peer] = prevLogIndex + sent
+                self.nextIndex[peer] = self.matchIndex[peer] + 1
+                return resp
+
+            # 失敗: nextIndex を下げて再試行（1未満にしない）
+            self.nextIndex[peer] = max(1, nextIndex - 1)
+
+
 
     async def elect(self):
         self.currentTerm += 1
@@ -243,7 +273,7 @@ class Node():
                     if ok >= need:
                         ## 見事選挙勝利！
                         self.job = Job.leader
-                        self.leader()
+                        self.leader_init()
                         break
             
         except asyncio.TimeoutError:
@@ -254,48 +284,25 @@ class Node():
                 if not t.done():
                     t.cancel()
 
+    async def leader_init(self):
+        last_log = self.get_last_log()
+        for i in other_nodes:
+            self.nextIndex[i] = last_log.index + 1
+            self.matchIndex[i] = 0
+
     # Leader処理
     async def leader(self):
-        last_log: LogEntry = self.get_last_log()
-        pos_by_index = {entry.index: i for i, entry in enumerate(self.log)}
+        last_index = len(self.log) - 1
+        tasks = []
+        for peer in other_nodes:
+            if last_index >= self.nextIndex[peer]:
+                tasks.append(asyncio.create_task(self.send_AppendEntries_rpc(peer)))
+            else:
+                # heartbeat を送りたいなら、entries=[] で send_AppendEntries_rpc を呼んでもOK
+                tasks.append(asyncio.create_task(self.send_AppendEntries_rpc(peer)))
 
-        tasks = [
-            asyncio.create_task(self.client.post(url=f"http://{i}/get/last_log", timeout=0.050))
-            for i in other_nodes
-        ]
-        nextIndex = self.nextIndex
-
-        try:
-            for i in asyncio.as_completed(tasks):
-                resp = await i
-                resp = resp.json()
-                resp = LogEntry(**resp)
-                if resp.index >= self.nextIndex[]:
-                    real_nextIndex = pos_by_index.get(nextIndex)
-                    while True:
-                        entries = self.log[real_nextIndex:]
-                        payload = AppendEntriesArgs(term=self.currentTerm,
-                                leaderID=self.host,
-                                prevLogIndex=last_log.index,
-                                prevLogTerm=last_log.term,
-                                entries=entries,
-                                leaderCommit=self.commitIndex)
-                        
-                        r = await self.client.post(url = f"http://{resp.host}/AppendEntries", json = payload.model_dump(),  timeout=0.05)
-                        r = AppendEntriesResult(r.json())
-                
-                        if self.currentTerm >= r.term and r.success is False:
-                            break
-                        
-                        if r.success is True:
-                            pay = team_index(nextIndex= nextIndex, matchIndex=nextIndex-1)
-                            await self.client.post(url = f"http://{resp.host}/update/nextIndex", json = pay.model_dump())
-
-                        nextIndex -= 1
-                        real_nextIndex -= 1
-
-        except Exception as e:
-            pass
+        # まとめて待つ（待ちたくないなら as_completed にする）
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
     # 常駐処理
