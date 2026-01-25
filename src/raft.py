@@ -11,8 +11,6 @@ from enum import Enum
 from pydantic import BaseModel
 from typing import Any, Literal
 
-import logging
-
 other_nodes: list[str] = os.environ["PEERS"].split(",")
 
 
@@ -271,6 +269,7 @@ class Node():
                         self.job = Job.leader
                         self.leaderid = self.host
                         self.leader_init()
+                        print(f"【選挙終了】{self.currentTerm -1}の{self.host}がリーダーに決定。")
                         break
             
         except asyncio.TimeoutError:
@@ -333,6 +332,7 @@ class Node():
                     now = time.monotonic()
                     # 選挙開始
                     if now - self.start_time > self.timeout:
+                        print(f"【選挙開始】{self.host}が被候補者に")
                         self.job = Job.candidate
                         try:
                             await asyncio.wait_for(self.elect(), timeout = self.timeout)
@@ -367,6 +367,40 @@ node = Node()
 
 app = FastAPI(lifespan=lifespan)
 
+# Rules for Servers
+## All Servers
+@app.post("/RequestVote")
+async def vote(args: RequestVoteArgs):
+    print("【受信】投票依頼を確認")
+    return node.RequestVote_RPC(args)
+
+@app.post("/AppendEntries")
+async def test_send_append_entries(args: AppendEntriesArgs):
+    return node.AppendEntries_RPC(args)
+
+@app.post("/from_client")
+async def client(command: list[Command]):
+    print("【受信】クライアントからの要求を確認。")
+    if node.job == Job.leader:
+        print(f"【受信】リーダー{node.host}自身のログに反映")
+        node.add_log_entry(command)
+        print(f"ログ一覧{node.log}")
+        return node.log[-1]
+    elif node.leaderid is None:
+        raise HTTPException(status_code=503, detail="leader election in progress")
+    else:
+        try:
+            r = await node.client.post(
+                f"http://{node.leaderid}:8000/from_client",
+                json=[c.model_dump() for c in command],
+                timeout=2.0,
+            )
+            return r.json()
+
+        except Exception:
+            raise HTTPException(status_code=503, detail="leader unreachable")
+
+# デバッグ用
 @app.get("/")
 async def raft():
     return other_nodes
@@ -396,34 +430,4 @@ async def test():
     async with httpx.AsyncClient() as client:
         r = await client.get(f'http://{other_nodes[0]}/')
         return (r.status_code, r.text)
-
-# Rules for Servers
-## All Servers
-
-@app.post("/RequestVote")
-async def vote(args: RequestVoteArgs):
-    return node.RequestVote_RPC(args)
-
-@app.post("/AppendEntries")
-async def test_send_append_entries(args: AppendEntriesArgs):
-    return node.AppendEntries_RPC(args)
-
-@app.post("/from_client")
-async def client(command: list[Command]):
-    if node.job == Job.leader:
-        node.add_log_entry(command)
-        return node.log[-1]
-    elif node.leaderid is None:
-        raise HTTPException(status_code=503, detail="leader election in progress")
-    else:
-        try:
-            r = await node.client.post(
-                f"http://{node.leaderid}:8000/from_client",
-                json=[c.model_dump() for c in command],
-                timeout=2.0,
-            )
-            return r.json()
-
-        except Exception:
-            raise HTTPException(status_code=503, detail="leader unreachable")
 

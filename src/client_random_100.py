@@ -20,7 +20,6 @@ NODES = {
 STATE_KEYS = ["name", "age", "gender"]  # Literal に合わせる
 TIMEOUT = httpx.Timeout(connect=1.0, read=2.0, write=2.0, pool=2.0)
 
-
 async def get_state_and_term(client: httpx.AsyncClient, base_url: str) -> Tuple[Dict[str, Any], int]:
     """
     /get は (state, currentTerm) を返しているので JSON は [state, term] を想定
